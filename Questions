@@ -39,3 +39,14 @@ flatten_elements() (line 98) — walks the raw Figma node tree and keeps only no
 filter_interactive_elements() (line 145) — a second pass on top of that: always keeps INSTANCE/COMPONENT/TEXT; drops purely decorative shapes (RECTANGLE, VECTOR, LINE, ELLIPSE, STAR, POLYGON); and for FRAME/GROUP containers, drops ones with auto-generated placeholder names like "Frame 123", "Group 5", "Mask group" (via GENERIC_NAME_PATTERN), keeping only meaningfully-named ones.
 build_prompt() (line 211-215) — for whatever survives both filters, only 4 fields are actually sent to the model: name, type, parent, page. The node_id and visible flag on each FigmaElement are dropped entirely — they're only used internally (caching, filtering) and add nothing useful for the LLM.
 Net effect: a design with hundreds of raw Figma nodes gets reduced to a lean list of named, interactive, visible elements before it ever hits the prompt — which is also why the response is fast/cheap and why the AI doesn't hallucinate events off decorative shapes.
+
+Answer 2: the filterations are done by the LLm or through the code?
+All of it is done in plain Python code, before the LLM ever sees the data — none of the filtering is an AI decision.
+
+Specifically:
+
+flatten_elements() and filter_interactive_elements() in figma_client.py — deterministic rules (type-checks, a regex for generic names) that run on the Figma JSON in Python, purely in state.py's pipeline, before tagging_engine.py is even called.
+The 4-field trim (name/type/parent/page, dropping node_id/visible) in build_prompt() (tagging_engine.py:211-215) — also plain string/dict construction in Python.
+So by the time anything reaches Claude, the element list has already been through two rounds of hard-coded filtering. The LLM only ever sees the survivors — it has no visibility into what was excluded and no say in the exclusion logic.
+
+This is a useful distinction for the exec deck: it's not "the AI figures out what matters," it's "code narrows the input to what's structurally likely to matter, then the AI reasons about analytics intent on that narrowed set." Worth stating plainly since it affects how much you can claim the AI is "doing" versus what's deterministic preprocessing.
