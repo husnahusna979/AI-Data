@@ -1,1 +1,41 @@
 First ask him to explain how inputs and outputs are like after the uploading the required inputs what happened. whats tagging engine do. Also how match and confidence score we are getting how the output is being validated, what's removing from figma json before passing it to the llm.
+Answer: 
+Here's the full picture, tying together the pipeline, the tagging engine, scoring, validation, and the Figma cleanup step.
+
+1. Inputs → Outputs (recap)
+You upload: a Figma design (URL+token, or JSON file), an optional screenshot, and one-or-more XDM templates (one per event type). Once you hit Analyze, state.py:process_design() runs four steps: resolve the Figma elements → parse the XDM library → call the AI → validate + build final payloads. Output is the Event Catalog (one row per detected event: name, type, XDM match status, confidence) plus, per event, the filled XDM payload, the original template for comparison, and export options (JSON/Excel).
+
+2. What the Tagging Engine does
+tagging_engine.py is the AI-calling layer. It does three things:
+
+build_prompt() (line 210) — turns the Figma elements + XDM library into one text prompt for the model.
+_call_anthropic() (line 286) — sends that prompt + the system instructions (SYSTEM_PROMPT) + optional screenshot to Claude via OpenRouter, and gets back raw text.
+generate_tagging() (line 239) — parses that raw text into structured events (TaggingResponse), with fallback logic to strip markdown fences or salvage a truncated response if the model got cut off mid-JSON (_salvage_partial_json).
+It does not decide events itself — the system prompt tells the model exactly which of the 10 canonical event types to look for (View, Click, Basket Add, etc.) and when to emit them; the engine is just the transport + parsing layer.
+
+3. Match % and Confidence — both are the AI's own self-reported scores, not computed
+This is worth knowing for the demo: neither number is calculated by the app's code. They come straight from the model's JSON response:
+
+xdm_match_confidence — per SYSTEM_PROMPT step 3: the model is told to self-score 1.0 for an exact name match to a library key, 0.9 for a semantic match, 0.75 for an alias match.
+confidence — per step 6: "how confident are you this event should fire (0.0-1.0)" — pure model judgment, along with a matching assumptions list explaining its reasoning.
+The one number that is independently computed by code is match_percentage — see next section.
+
+4. Output validation — this part IS deterministic code, not AI
+xdm_validator.py:validate_json_payload() compares the generated payload against the original template structurally:
+
+Flattens both into dot-notation key paths (_get_all_paths()).
+missing_keys = paths in the template but absent from the generated payload.
+extra_keys = paths the AI added that aren't in the template (should basically never happen if the "never restructure" rule is followed).
+match_percentage = (template keys matched) / (total template keys).
+is_valid = true only if there are zero missing and zero extra keys.
+count_placeholders() (line 47) separately counts remaining {{...}} tokens — fields the AI couldn't determine from the design, left for runtime.
+
+This is the governance check for your exec demo: it's proof the app independently verifies the AI didn't drift from the user's template, rather than just trusting the model's word.
+
+5. What gets stripped from the Figma JSON before it reaches the LLM
+Two filtering passes happen in figma_client.py, then a final field-stripping step in the prompt builder:
+
+flatten_elements() (line 98) — walks the raw Figma node tree and keeps only nodes that are both visible and one of {INSTANCE, COMPONENT, TEXT, RECTANGLE, FRAME, GROUP, VECTOR}. Anything invisible, or any node type outside that set (images, ellipses, lines, stars, polygons, boolean ops, slices, stickies, etc.), never even makes it into the flattened list.
+filter_interactive_elements() (line 145) — a second pass on top of that: always keeps INSTANCE/COMPONENT/TEXT; drops purely decorative shapes (RECTANGLE, VECTOR, LINE, ELLIPSE, STAR, POLYGON); and for FRAME/GROUP containers, drops ones with auto-generated placeholder names like "Frame 123", "Group 5", "Mask group" (via GENERIC_NAME_PATTERN), keeping only meaningfully-named ones.
+build_prompt() (line 211-215) — for whatever survives both filters, only 4 fields are actually sent to the model: name, type, parent, page. The node_id and visible flag on each FigmaElement are dropped entirely — they're only used internally (caching, filtering) and add nothing useful for the LLM.
+Net effect: a design with hundreds of raw Figma nodes gets reduced to a lean list of named, interactive, visible elements before it ever hits the prompt — which is also why the response is fast/cheap and why the AI doesn't hallucinate events off decorative shapes.
